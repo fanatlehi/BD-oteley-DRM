@@ -1,0 +1,203 @@
+-- =====================================================
+-- 1. СОЗДАНИЕ БАЗЫ ДАННЫХ
+-- =====================================================
+CREATE DATABASE HotelDB;
+\c HotelDB;
+
+-- =====================================================
+-- 2. ТАБЛИЦЫ
+-- =====================================================
+
+-- 2.1. Гостиницы (Hotels)
+CREATE TABLE Hotels (
+    HotelID SERIAL PRIMARY KEY,
+    Name VARCHAR(100) NOT NULL,
+    Inn VARCHAR(12) UNIQUE NOT NULL,
+    Director VARCHAR(100) NOT NULL,
+    Owner VARCHAR(100) NOT NULL,
+    Address VARCHAR(200) NOT NULL,
+    Phone VARCHAR(20),
+    Email VARCHAR(100)
+);
+
+-- 2.2. Должности (Positions)
+CREATE TABLE Positions (
+    PositionID SERIAL PRIMARY KEY,
+    Title VARCHAR(50) NOT NULL UNIQUE,
+    BaseSalary NUMERIC(10,2) CHECK (BaseSalary > 0),
+    Responsibilities TEXT
+);
+
+-- 2.3. Персонал (Staff)
+CREATE TABLE Staff (
+    StaffID SERIAL PRIMARY KEY,
+    HotelID INT NOT NULL REFERENCES Hotels(HotelID) ON DELETE CASCADE,
+    FullName VARCHAR(100) NOT NULL,
+    PositionID INT NOT NULL REFERENCES Positions(PositionID),
+    Phone VARCHAR(20),
+    HireDate DATE DEFAULT CURRENT_DATE,
+    Inn VARCHAR(12) UNIQUE NOT NULL,
+    Salary NUMERIC(10,2) CHECK (Salary > 0)
+);
+
+-- 2.4. Номера (Rooms)
+CREATE TABLE Rooms (
+    RoomNumber VARCHAR(10) PRIMARY KEY,
+    HotelID INT NOT NULL REFERENCES Hotels(HotelID) ON DELETE CASCADE,
+    Description TEXT,
+    Capacity INT CHECK (Capacity > 0),
+    PricePerDay NUMERIC(10,2) CHECK (PricePerDay > 0),
+    Status VARCHAR(20) DEFAULT 'Available' CHECK (Status IN ('Available', 'Occupied', 'Under Repair'))
+);
+
+-- 2.5. Посетители (Guests)
+CREATE TABLE Guests (
+    GuestID SERIAL PRIMARY KEY,
+    FullName VARCHAR(100) NOT NULL,
+    Passport VARCHAR(20) UNIQUE NOT NULL,
+    Phone VARCHAR(20),
+    Email VARCHAR(100),
+    Address VARCHAR(200)
+);
+
+-- 2.6. Бронирования (Bookings) — связывает посетителей и номера
+CREATE TABLE Bookings (
+    BookingID SERIAL PRIMARY KEY,
+    RoomNumber VARCHAR(10) NOT NULL REFERENCES Rooms(RoomNumber) ON DELETE CASCADE,
+    GuestID INT NOT NULL REFERENCES Guests(GuestID) ON DELETE CASCADE,
+    CheckInDate DATE NOT NULL,
+    CheckOutDate DATE NOT NULL,
+    AdvancePayment NUMERIC(10,2) CHECK (AdvancePayment >= 0),
+    Status VARCHAR(20) DEFAULT 'Active' CHECK (Status IN ('Active', 'Cancelled', 'Completed')),
+    TotalCost NUMERIC(10,2) GENERATED ALWAYS AS (
+        (CheckOutDate - CheckInDate) * (SELECT PricePerDay FROM Rooms WHERE RoomNumber = Rooms.RoomNumber)
+    ) STORED
+);
+
+-- Добавим индексы для оптимизации
+CREATE INDEX idx_bookings_dates ON Bookings(CheckInDate, CheckOutDate);
+CREATE INDEX idx_rooms_status ON Rooms(Status);
+CREATE INDEX idx_staff_hotel ON Staff(HotelID);
+CREATE INDEX idx_bookings_guest ON Bookings(GuestID);
+CREATE INDEX idx_staff_name ON Staff(FullName);
+
+-- =====================================================
+-- 3. ПРЕДСТАВЛЕНИЯ (VIEWS)
+-- =====================================================
+
+-- 3.1. Простое представление: свободные номера
+CREATE VIEW AvailableRooms AS
+SELECT RoomNumber, Capacity, PricePerDay, Description
+FROM Rooms
+WHERE Status = 'Available';
+
+-- 3.2. Представление с GROUP BY и HAVING: загрузка отелей
+CREATE VIEW HotelOccupancyStats AS
+SELECT 
+    h.HotelID,
+    h.Name AS HotelName,
+    COUNT(b.BookingID) AS ActiveBookings,
+    SUM(b.AdvancePayment) AS TotalAdvance
+FROM Hotels h
+LEFT JOIN Rooms r ON h.HotelID = r.HotelID
+LEFT JOIN Bookings b ON r.RoomNumber = b.RoomNumber AND b.Status = 'Active'
+GROUP BY h.HotelID, h.Name
+HAVING COUNT(b.BookingID) > 0 OR SUM(b.AdvancePayment) IS NOT NULL;
+
+-- 3.3. Представление по нескольким таблицам: детали бронирований
+CREATE VIEW BookingDetails AS
+SELECT 
+    b.BookingID,
+    g.FullName AS GuestName,
+    r.RoomNumber,
+    ro.PricePerDay,
+    b.CheckInDate,
+    b.CheckOutDate,
+    b.AdvancePayment,
+    b.TotalCost,
+    b.Status
+FROM Bookings b
+JOIN Guests g ON b.GuestID = g.GuestID
+JOIN Rooms r ON b.RoomNumber = r.RoomNumber
+JOIN Rooms ro ON r.RoomNumber = ro.RoomNumber;
+
+-- =====================================================
+-- 4. ТРИГГЕРЫ
+-- =====================================================
+
+-- 4.1. Функция и триггер: автоматическое обновление статуса номера при бронировании
+CREATE OR REPLACE FUNCTION update_room_status()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.Status = 'Active' THEN
+        UPDATE Rooms SET Status = 'Occupied' WHERE RoomNumber = NEW.RoomNumber;
+    ELSIF OLD.Status = 'Active' AND NEW.Status != 'Active' THEN
+        UPDATE Rooms SET Status = 'Available' 
+        WHERE RoomNumber = NEW.RoomNumber 
+        AND NOT EXISTS (
+            SELECT 1 FROM Bookings 
+            WHERE RoomNumber = NEW.RoomNumber 
+            AND Status = 'Active'
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_update_room_status
+AFTER INSERT OR UPDATE OF Status ON Bookings
+FOR EACH ROW
+EXECUTE FUNCTION update_room_status();
+
+-- 4.2. Функция и триггер: каскадное обновление общей стоимости при изменении цены номера
+CREATE OR REPLACE FUNCTION update_booking_totalcost()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.PricePerDay != OLD.PricePerDay THEN
+        UPDATE Bookings 
+        SET TotalCost = (CheckOutDate - CheckInDate) * NEW.PricePerDay
+        WHERE RoomNumber = OLD.RoomNumber 
+        AND Status IN ('Active', 'Completed');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_update_booking_cost
+AFTER UPDATE OF PricePerDay ON Rooms
+FOR EACH ROW
+EXECUTE FUNCTION update_booking_totalcost();
+
+-- =====================================================
+-- 5. ТЕСТОВЫЕ ДАННЫЕ
+-- =====================================================
+
+INSERT INTO Hotels (Name, Inn, Director, Owner, Address, Phone, Email) VALUES
+('Grand Hotel', '123456789012', 'Иванов И.И.', 'ООО "Гранд"', 'ул. Центральная, 1', '+71234567890', 'grand@hotel.com'),
+('Sunny Resort', '987654321098', 'Петров П.П.', 'ЗАО "Санни"', 'ул. Морская, 10', '+70987654321', 'sunny@resort.com');
+
+INSERT INTO Positions (Title, BaseSalary, Responsibilities) VALUES
+('Менеджер', 50000.00, 'Управление персоналом'),
+('Горничная', 25000.00, 'Уборка номеров'),
+('Портье', 30000.00, 'Регистрация гостей'),
+('Администратор', 40000.00, 'Обслуживание клиентов');
+
+INSERT INTO Staff (HotelID, FullName, PositionID, Phone, HireDate, Inn, Salary) VALUES
+(1, 'Сидорова А.А.', 1, '+71234567891', '2023-01-15', '111222333444', 50000.00),
+(1, 'Кузнецов В.В.', 3, '+71234567892', '2023-03-10', '555666777888', 30000.00),
+(2, 'Иванова Е.Е.', 1, '+70987654322', '2023-05-20', '999000111222', 50000.00);
+
+INSERT INTO Rooms (RoomNumber, HotelID, Description, Capacity, PricePerDay, Status) VALUES
+('101', 1, 'Стандарт', 2, 3000.00, 'Available'),
+('102', 1, 'Люкс', 4, 5000.00, 'Available'),
+('103', 1, 'Стандарт', 2, 3000.00, 'Occupied'),
+('201', 2, 'Стандарт', 2, 3500.00, 'Available'),
+('202', 2, 'Семейный', 4, 6000.00, 'Under Repair');
+
+INSERT INTO Guests (FullName, Passport, Phone, Email, Address) VALUES
+('Клиентов А.Б.', '1234 567890', '+79123456789', 'client1@example.com', 'ул. Ленина, 5'),
+('Петрова М.В.', '2345 678901', '+79234567890', 'client2@example.com', 'пр. Мира, 15');
+
+INSERT INTO Bookings (RoomNumber, GuestID, CheckInDate, CheckOutDate, AdvancePayment, Status) VALUES
+('103', 1, '2025-06-01', '2025-06-05', 5000.00, 'Active'),
+('101', 2, '2025-07-10', '2025-07-15', 10000.00, 'Active');
